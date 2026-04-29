@@ -16,7 +16,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.1.8"
+SCRIPT_VERSION="1.2.0"
 LOG_FILE="/var/log/esxi-migrate-$(date +%Y%m%d-%H%M%S).log"
 DEFAULT_STAGING="/var/lib/vz/images/tmp"
 SSH_CTL_PATH="/tmp/esxi-mig-ctl"          # SSH ControlMaster socket path
@@ -33,6 +33,10 @@ PROXMOX_STORAGE=""
 BRIDGE="vmbr0"
 CONVERT_FORMAT="qcow2"
 CONVERT_OPTS=""
+MACHINE_TYPE=""        # blank = Proxmox default; "pc" (i440fx) or "q35"
+CPU_TYPE="kvm64"       # kvm64 = safe default; "host" = max perf (breaks live migrate)
+DISK_BUS="scsi"        # scsi (virtio-scsi-pci), sata, ide, virtio
+SCSIHW="virtio-scsi-pci"  # set automatically based on DISK_BUS choice
 
 declare -A VM_IDS=()       # vmname -> vmid
 declare -A VM_STATES=()    # vmname -> power state string
@@ -656,12 +660,80 @@ configure_proxmox_settings() {
         *) CONVERT_FORMAT="qcow2"; CONVERT_OPTS=""    ;;
     esac
 
+    # Storage format vs type advisory
+    echo ""
+    local storage_type
+    storage_type=$(pvesm status 2>/dev/null | awk -v s="$PROXMOX_STORAGE" '$1==s{print $2}')
+    if [[ "$storage_type" == "lvmthin" || "$storage_type" == "lvm" || "$storage_type" == "zfspool" ]]; then
+        if [[ "$CONVERT_FORMAT" == "qcow2" ]]; then
+            warn "Storage '${PROXMOX_STORAGE}' (type: ${storage_type}) only supports raw format."
+            warn "qcow2 will be rejected at import time — switching default format to raw."
+            warn "Proxmox snapshots still work via LVM/ZFS native CoW on this storage type."
+            CONVERT_FORMAT="raw"; CONVERT_OPTS="-S 0"
+        fi
+    fi
+
+    # Machine type
+    echo ""
+    echo "Machine type (virtual chipset):"
+    echo "  1) Default — let Proxmox decide  (safe, Proxmox pins version automatically)"
+    echo "  2) pc        i440FX / PIIX        (most compatible with VMware migrations)"
+    echo "  3) q35       PCIe / ICH9          (recommended for Windows 10/11 long-term)"
+    read -rp "$(echo -e "${CYAN}Machine type${NC} [1]: ")" mt
+    case "${mt:-1}" in
+        2) MACHINE_TYPE="pc"  ;;
+        3) MACHINE_TYPE="q35" ;;
+        *) MACHINE_TYPE=""    ;;
+    esac
+
+    # CPU type
+    echo ""
+    echo "CPU type:"
+    echo "  1) kvm64   Safe default — compatible across all hosts"
+    echo "  2) host    Pass through host CPU — best performance, breaks live migration"
+    echo "  3) x86-64-v2-AES  Baseline x86-64 v2 with AES — good balance"
+    read -rp "$(echo -e "${CYAN}CPU type${NC} [1]: ")" ct
+    case "${ct:-1}" in
+        2) CPU_TYPE="host"          ;;
+        3) CPU_TYPE="x86-64-v2-AES" ;;
+        *) CPU_TYPE="kvm64"         ;;
+    esac
+
+    # Disk bus type
+    echo ""
+    echo "Disk bus / controller for imported VMs:"
+    echo "  1) scsi   virtio-scsi-pci  (best for Linux; Windows needs VirtIO drivers)"
+    echo "  2) sata   AHCI SATA        (Windows-compatible without extra drivers)"
+    echo "  3) ide    IDE/PATA         (most compatible, slowest — use if sata fails)"
+    echo "  4) virtio virtio-blk       (fastest Linux I/O; Windows needs VirtIO drivers)"
+    echo ""
+    echo -e "  ${YELLOW}For Windows migrations: sata is recommended until VirtIO drivers are installed.${NC}"
+    echo -e "  ${YELLOW}For Linux migrations:   scsi (virtio-scsi) is recommended.${NC}"
+    read -rp "$(echo -e "${CYAN}Disk bus${NC} [1]: ")" db
+    case "${db:-1}" in
+        2) DISK_BUS="sata"   ;;
+        3) DISK_BUS="ide"    ;;
+        4) DISK_BUS="virtio" ;;
+        *) DISK_BUS="scsi"   ;;
+    esac
+
+    # scsi controller flag — only used for scsi bus
+    case "$DISK_BUS" in
+        scsi)   SCSIHW="virtio-scsi-pci" ;;
+        sata)   SCSIHW="" ;;
+        ide)    SCSIHW="" ;;
+        virtio) SCSIHW="" ;;
+    esac
+
     echo ""
     info "Settings confirmed:"
     info "  Staging:         $STAGING_PATH  (${avail} available)"
-    info "  Proxmox storage: $PROXMOX_STORAGE"
+    info "  Proxmox storage: $PROXMOX_STORAGE  (type: ${storage_type:-unknown})"
     info "  Default bridge:  $BRIDGE"
     info "  Disk format:     $CONVERT_FORMAT ${CONVERT_OPTS}"
+    info "  Machine type:    ${MACHINE_TYPE:-default}"
+    info "  CPU type:        $CPU_TYPE"
+    info "  Disk bus:        $DISK_BUS"
     pause
 }
 
@@ -1031,11 +1103,13 @@ create_proxmox_vm() {
         ((pnic_num++))
     done
 
-    # Firmware flag
+    # Firmware flag — UEFI also requires an EFI disk for variable storage
     local bios_flag=""
+    local is_uefi=false
     if echo "${VMX_FIRMWARE:-bios}" | grep -qi "efi"; then
         info "UEFI firmware detected — enabling OVMF in Proxmox."
         bios_flag="--bios ovmf"
+        is_uefi=true
     fi
 
     echo ""
@@ -1043,7 +1117,10 @@ create_proxmox_vm() {
 
     # Build qm create command with all NIC arguments expanded
     local qm_cmd="qm create $vmid --name $vmname --memory $ram --cores $cpu"
-    qm_cmd+=" --ostype $VMX_OSTYPE --scsihw virtio-scsi-pci $bios_flag"
+    qm_cmd+=" --ostype $VMX_OSTYPE --cpu ${CPU_TYPE:-kvm64}"
+    [[ -n "${MACHINE_TYPE:-}" ]]  && qm_cmd+=" --machine $MACHINE_TYPE"
+    [[ -n "${SCSIHW:-}" ]]        && qm_cmd+=" --scsihw $SCSIHW"
+    qm_cmd+=" $bios_flag"
     for net_arg in "${NET_ARGS[@]}"; do
         qm_cmd+=" $net_arg"
     done
@@ -1054,16 +1131,28 @@ create_proxmox_vm() {
 
     log "qm create: vmid=$vmid name=$vmname cpu=$cpu ram=$ram nics=${#VMX_NICS[@]}"
 
-    # Import and attach each converted disk
+    # UEFI VMs need an EFI disk — Proxmox stores UEFI variables there.
+    # Without it the VM silently falls back to SeaBIOS or fails to boot.
+    # pre-enrolled-keys=0 skips Secure Boot key enrollment (safer default).
+    if $is_uefi; then
+        info "Adding EFI disk for UEFI variable storage..."
+        if ! qm set "$vmid"             --efidisk0 "${PROXMOX_STORAGE}:0,format=raw,efitype=4m,pre-enrolled-keys=0"             2>&1 | tee -a "$LOG_FILE"; then
+            warn "EFI disk creation failed — VM may not boot correctly via UEFI."
+            warn "Add manually: qm set $vmid --efidisk0 ${PROXMOX_STORAGE}:0,format=raw,efitype=4m,pre-enrolled-keys=0"
+        fi
+    fi
+
+    # Import and attach each converted disk using the configured bus type
     local dnum=0
+    local bus="${DISK_BUS:-scsi}"
     for disk in "${CONVERTED_DISKS[@]}"; do
         [[ -f "$disk" ]] || continue
         local ext="${disk##*.}"
-        info "Importing disk $((dnum+1)): $(basename "$disk") → ${PROXMOX_STORAGE}"
+        info "Importing disk $((dnum+1)): $(basename "$disk") → ${PROXMOX_STORAGE} (bus: ${bus})"
         qm importdisk "$vmid" "$disk" "$PROXMOX_STORAGE" --format "$ext" 2>&1 | tee -a "$LOG_FILE"
-        qm set "$vmid" --scsi${dnum} "${PROXMOX_STORAGE}:vm-${vmid}-disk-${dnum}" 2>&1 | tee -a "$LOG_FILE"
+        qm set "$vmid" --${bus}${dnum} "${PROXMOX_STORAGE}:vm-${vmid}-disk-${dnum}" 2>&1 | tee -a "$LOG_FILE"
         if [[ $dnum -eq 0 ]]; then
-            qm set "$vmid" --boot c --bootdisk scsi0 2>&1 | tee -a "$LOG_FILE"
+            qm set "$vmid" --boot c --bootdisk ${bus}0 2>&1 | tee -a "$LOG_FILE"
         fi
         ((dnum++))
     done
@@ -1184,6 +1273,8 @@ show_main_menu() {
         printf "  %-20s ${CYAN}%s VM(s)${NC}\n" "VMs scanned:" "${#VM_IDS[@]}"
         printf "  %-20s ${CYAN}%s${NC}\n" "Storage target:" "${PROXMOX_STORAGE:-not set}"
         printf "  %-20s ${CYAN}%s${NC}\n" "Disk format:"   "${CONVERT_FORMAT}"
+        printf "  %-20s ${CYAN}machine=%-8s cpu=%-12s bus=%s${NC}\n" "VM settings:" \
+            "${MACHINE_TYPE:-default}" "${CPU_TYPE:-kvm64}" "${DISK_BUS:-scsi}"
         printf "  %-20s ${CYAN}%s VM(s)${NC}\n" "Queue:"   "${#VM_QUEUE[@]}"
         echo ""
         hr
