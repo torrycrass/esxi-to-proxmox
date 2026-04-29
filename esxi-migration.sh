@@ -16,7 +16,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.1.6"
+SCRIPT_VERSION="1.2.0"
 LOG_FILE="/var/log/esxi-migrate-$(date +%Y%m%d-%H%M%S).log"
 DEFAULT_STAGING="/var/lib/vz/images/tmp"
 SSH_CTL_PATH="/tmp/esxi-mig-ctl"          # SSH ControlMaster socket path
@@ -711,17 +711,16 @@ manage_queue() {
 # ─── VMX Parser ───────────────────────────────────────────────────────────────
 parse_vmx() {
     local vmx="$1"
-    VMX_CPU=$(grep -im1 '^numvcpus'             "$vmx" | cut -d= -f2 | tr -d ' "' || echo "1")
-    VMX_RAM=$(grep -im1 '^memsize'              "$vmx" | cut -d= -f2 | tr -d ' "' || echo "512")
-    VMX_FIRMWARE=$(grep -im1 '^firmware'        "$vmx" | cut -d= -f2 | tr -d ' "' || echo "bios")
-    VMX_GUESTOS=$(grep -im1 '^guestOS'          "$vmx" | cut -d= -f2 | tr -d ' "' || echo "other")
-    VMX_NET_DEV=$(grep -im1 'ethernet0.virtualDev' "$vmx" | cut -d= -f2 | tr -d ' "' || echo "e1000")
+    VMX_CPU=$(grep -im1 '^numvcpus'      "$vmx" | cut -d= -f2 | tr -d ' '\''"' || echo "1")
+    VMX_RAM=$(grep -im1 '^memsize'       "$vmx" | cut -d= -f2 | tr -d ' '\''"' || echo "512")
+    VMX_FIRMWARE=$(grep -im1 '^firmware' "$vmx" | cut -d= -f2 | tr -d ' '\''"' || echo "bios")
+    VMX_GUESTOS=$(grep -im1 '^guestOS'   "$vmx" | cut -d= -f2 | tr -d ' '\''"' || echo "other")
     VMX_CPU="${VMX_CPU:-1}"; VMX_RAM="${VMX_RAM:-512}"
 
     # Disk references (all disks attached to this VM)
     VMX_DISKS=()
     while IFS= read -r dl; do
-        local f; f=$(echo "$dl" | cut -d= -f2 | tr -d ' "')
+        local f; f=$(echo "$dl" | cut -d= -f2 | tr -d ' '\''"')
         [[ "$f" == *.vmdk ]] && VMX_DISKS+=("$f")
     done < <(grep -i '\.fileName' "$vmx" | grep -i 'vmdk' || true)
 
@@ -736,12 +735,36 @@ parse_vmx() {
         *)                VMX_OSTYPE="other" ;;
     esac
 
-    # VMware NIC type → Proxmox model
-    case "${VMX_NET_DEV,,}" in
-        vmxnet3)      VMX_NET_MODEL="virtio" ;;
-        e1000|e1000e) VMX_NET_MODEL="e1000"  ;;
-        *)            VMX_NET_MODEL="virtio"  ;;
-    esac
+    # NIC detection — scan all ethernetX.virtualDev entries in order.
+    # Builds VMX_NICS as an array of "index:vmware_dev:proxmox_model" tuples.
+    # Skips adapters explicitly marked ethernet X.present = "FALSE".
+    VMX_NICS=()
+    while IFS= read -r nic_line; do
+        # Extract the adapter index from the key name
+        local nic_idx
+        nic_idx=$(echo "$nic_line" | grep -o 'ethernet[0-9]*' | grep -o '[0-9]*')
+
+        # Skip if adapter is explicitly disabled
+        local present
+        present=$(grep -im1 "^ethernet${nic_idx}.present" "$vmx" | cut -d= -f2 | tr -d ' '\''"')
+        [[ "${present,,}" == "false" ]] && continue
+
+        # Extract the VMware device type and map to Proxmox model
+        local nic_dev nic_model
+        nic_dev=$(echo "$nic_line" | cut -d= -f2 | tr -d ' '\''"')
+        case "${nic_dev,,}" in
+            vmxnet3)      nic_model="virtio" ;;
+            e1000|e1000e) nic_model="e1000"  ;;
+            *)            nic_model="virtio"  ;;
+        esac
+
+        VMX_NICS+=("${nic_idx}:${nic_dev}:${nic_model}")
+    done < <(grep -i 'ethernet[0-9]*\.virtualDev' "$vmx" | sort)
+
+    # Fallback: if no NICs detected in VMX, assume one e1000
+    if [[ ${#VMX_NICS[@]} -eq 0 ]]; then
+        VMX_NICS=("0:e1000:e1000")
+    fi
 }
 
 # ─── Transfer VM ──────────────────────────────────────────────────────────────
@@ -900,20 +923,24 @@ create_proxmox_vm() {
     echo ""
     printf "${BOLD}Detected from VMX file:${NC}\n"
     hr
-    printf "  %-20s %s\n"    "CPU cores:"    "${VMX_CPU:-1}"
-    printf "  %-20s %s MB\n" "Memory:"       "${VMX_RAM:-512}"
-    printf "  %-20s %s\n"    "Firmware:"     "${VMX_FIRMWARE:-bios}"
+    printf "  %-20s %s\n"    "CPU cores:"      "${VMX_CPU:-1}"
+    printf "  %-20s %s MB\n" "Memory:"         "${VMX_RAM:-512}"
+    printf "  %-20s %s\n"    "Firmware:"       "${VMX_FIRMWARE:-bios}"
     printf "  %-20s %s  →  Proxmox ostype: %s\n" "Guest OS:" "$VMX_GUESTOS" "$VMX_OSTYPE"
-    printf "  %-20s %s  →  Proxmox model:  %s\n" "Network adapter:" "$VMX_NET_DEV" "$VMX_NET_MODEL"
     printf "  %-20s %s\n"    "Disks to import:" "${#CONVERTED_DISKS[@]}"
-    printf "  %-20s %s\n"    "Assigned bridge:" "$vm_bridge"
+    printf "  %-20s %s NIC(s) detected:\n" "Network:" "${#VMX_NICS[@]}"
+    local nic_entry
+    for nic_entry in "${VMX_NICS[@]}"; do
+        local ni nd nm; IFS='::' read -r ni nd nm <<< "$nic_entry"
+        printf "    NIC %s: %s  →  %s\n" "$ni" "$nd" "$nm"
+    done
     hr
     echo ""
     echo "Adjust values or press Enter to accept each:"
     echo ""
 
-    read -rp "$(echo -e "${CYAN}CPU cores${NC} [${VMX_CPU:-1}]: ")"     input; local cpu="${input:-${VMX_CPU:-1}}"
-    read -rp "$(echo -e "${CYAN}Memory MB${NC} [${VMX_RAM:-512}]: ")"   input; local ram="${input:-${VMX_RAM:-512}}"
+    read -rp "$(echo -e "${CYAN}CPU cores${NC} [${VMX_CPU:-1}]: ")"   input; local cpu="${input:-${VMX_CPU:-1}}"
+    read -rp "$(echo -e "${CYAN}Memory MB${NC} [${VMX_RAM:-512}]: ")" input; local ram="${input:-${VMX_RAM:-512}}"
 
     # VMID
     local vmid
@@ -921,17 +948,32 @@ create_proxmox_vm() {
            echo $(( $(qm list 2>/dev/null | tail -n+2 | awk '{print $1}' | sort -n | tail -1) + 1 )))
     read -rp "$(echo -e "${CYAN}VMID${NC} [${vmid}]: ")" input; vmid="${input:-$vmid}"
 
-    # Bridge — show current and allow override here too
-    echo ""
+    # Available bridges (shown once, referenced per NIC below)
     local bridges
     bridges=$(ip link show type bridge 2>/dev/null \
         | grep -oP '(?<=^\d{1,3}: )\w+(?=:)' | tr '\n' '  ')
+    echo ""
     echo -e "  Available bridges: ${CYAN}${bridges:-none found}${NC}"
-    read -rp "$(echo -e "${CYAN}Bridge for this VM${NC} [${vm_bridge}]: ")" input
-    vm_bridge="${input:-$vm_bridge}"
 
-    read -rp "$(echo -e "${CYAN}Network model${NC} [${VMX_NET_MODEL}]: ")" input
-    local net_model="${input:-$VMX_NET_MODEL}"
+    # Per-NIC bridge and model configuration.
+    # NIC 0 defaults to the bridge assigned at queue time.
+    # Additional NICs default to the session bridge.
+    local -a NET_ARGS=()
+    local pnic_num=0
+    for nic_entry in "${VMX_NICS[@]}"; do
+        local ni nd nm; IFS='::' read -r ni nd nm <<< "$nic_entry"
+        local default_br
+        [[ $pnic_num -eq 0 ]] && default_br="$vm_bridge" || default_br="$BRIDGE"
+        echo ""
+        echo -e "  ${BOLD}NIC $((pnic_num+1)) of ${#VMX_NICS[@]}${NC}  (VMware: ${nd}  →  Proxmox default: ${nm})"
+        read -rp "$(echo -e "    ${CYAN}Bridge${NC} [${default_br}]: ")" input
+        local this_br="${input:-$default_br}"
+        read -rp "$(echo -e "    ${CYAN}Model${NC}  [${nm}]: ")" input
+        local this_model="${input:-$nm}"
+        NET_ARGS+=("--net${pnic_num} ${this_model},bridge=${this_br}")
+        log "NIC $pnic_num: model=$this_model bridge=$this_br (vmware: $nd)"
+        ((pnic_num++))
+    done
 
     # Firmware flag
     local bios_flag=""
@@ -941,20 +983,20 @@ create_proxmox_vm() {
     fi
 
     echo ""
-    info "Creating VM shell (VMID: $vmid, Name: $vmname)..."
+    info "Creating VM shell (VMID: $vmid, Name: $vmname, NICs: ${#VMX_NICS[@]})..."
 
-    if ! qm create "$vmid" \
-        --name "$vmname" \
-        --memory "$ram" \
-        --cores "$cpu" \
-        --ostype "$VMX_OSTYPE" \
-        --net0 "${net_model},bridge=${vm_bridge}" \
-        --scsihw virtio-scsi-pci \
-        $bios_flag 2>&1 | tee -a "$LOG_FILE"; then
+    # Build qm create command with all NIC arguments expanded
+    local qm_cmd="qm create $vmid --name $vmname --memory $ram --cores $cpu"
+    qm_cmd+=" --ostype $VMX_OSTYPE --scsihw virtio-scsi-pci $bios_flag"
+    for net_arg in "${NET_ARGS[@]}"; do
+        qm_cmd+=" $net_arg"
+    done
+
+    if ! eval "$qm_cmd" 2>&1 | tee -a "$LOG_FILE"; then
         err "qm create failed."; return 1
     fi
 
-    log "qm create: vmid=$vmid name=$vmname cpu=$cpu ram=$ram net=${net_model} bridge=$vm_bridge"
+    log "qm create: vmid=$vmid name=$vmname cpu=$cpu ram=$ram nics=${#VMX_NICS[@]}"
 
     # Import and attach each converted disk
     local dnum=0
@@ -970,8 +1012,8 @@ create_proxmox_vm() {
         ((dnum++))
     done
 
-    info "VM ready: $vmname  (VMID: $vmid,  Disks: $dnum,  Bridge: $vm_bridge)"
-    log "VM created: $vmname VMID=$vmid disks=$dnum bridge=$vm_bridge"
+    info "VM ready: $vmname  (VMID: $vmid,  Disks: $dnum,  NICs: ${#VMX_NICS[@]})"
+    log "VM created: $vmname VMID=$vmid disks=$dnum nics=${#VMX_NICS[@]}"
 
     # Windows advisory
     if echo "${VMX_GUESTOS:-}" | grep -qi "windows"; then
