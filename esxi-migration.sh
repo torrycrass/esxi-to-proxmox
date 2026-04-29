@@ -16,7 +16,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.1.3"
+SCRIPT_VERSION="1.1.6"
 LOG_FILE="/var/log/esxi-migrate-$(date +%Y%m%d-%H%M%S).log"
 DEFAULT_STAGING="/var/lib/vz/images/tmp"
 SSH_CTL_PATH="/tmp/esxi-mig-ctl"          # SSH ControlMaster socket path
@@ -96,17 +96,31 @@ esxi_run_script() {
     return $exit_code
 }
 
-esxi_rsync() {
-    local remote_src="$1"; shift
+# Transfer a single file from ESXi to Proxmox via SSH + cat | dd.
+# ESXi does not have rsync, so we use cat on the remote side and
+# GNU dd with conv=sparse on the Proxmox side to reconstruct
+# thin-provisioned files as sparse files on the destination.
+# Note: the full thin-provisioned size travels over the wire (zero blocks
+# included), but the destination file is sparse so only written blocks
+# consume actual disk space.
+esxi_transfer_file() {
+    local remote_src="$1"
+    local local_dst="$2"
     local opts; opts=$(_ssh_base_opts)
-    local ssh_cmd
+
     if $ESXI_USE_KEY; then
-        ssh_cmd="ssh $opts -i $ESXI_KEY_PATH"
+        ssh $opts -i "$ESXI_KEY_PATH" "${ESXI_USER}@${ESXI_HOST}"             "cat '${remote_src}'" 2>/dev/null             | dd of="$local_dst" bs=1M conv=sparse status=progress 2>&1
     else
-        ssh_cmd="sshpass -p '$ESXI_PASS' ssh $opts"
+        sshpass -p "$ESXI_PASS" ssh $opts "${ESXI_USER}@${ESXI_HOST}"             "cat '${remote_src}'" 2>/dev/null             | dd of="$local_dst" bs=1M conv=sparse status=progress 2>&1
     fi
-    rsync -avhP --sparse -e "$ssh_cmd" \
-        "${ESXI_USER}@${ESXI_HOST}:${remote_src}" "$@"
+
+    local pipe_rc=("${PIPESTATUS[@]}")
+    # PIPESTATUS[0] = ssh/sshpass exit code, PIPESTATUS[1] = dd exit code
+    if [[ ${pipe_rc[0]} -ne 0 || ${pipe_rc[1]} -ne 0 ]]; then
+        err "Transfer failed: $(basename "$remote_src")  (ssh:${pipe_rc[0]} dd:${pipe_rc[1]})"
+        return 1
+    fi
+    return 0
 }
 
 # Cleanly close the SSH ControlMaster when the script exits
@@ -287,11 +301,8 @@ printf "%s\n" "$VMLIST"
 printf "===DETAILS===\n"
 VMIDS=$(printf "%s\n" "$VMLIST" | grep -E "^[[:space:]]*[0-9]+" | awk "{print \$1}")
 for VMID in $VMIDS; do
-    STATE=$(vim-cmd vmsvc/power.getstate $VMID 2>/dev/null \
-        | tail -1 | tr -d "\r" \
-        | sed "s/^[[:space:]]*//" | sed "s/[[:space:]]*$//")
-    SNAPS=$(vim-cmd vmsvc/snapshot.get $VMID 2>/dev/null \
-        | grep -c "Snapshot Name" 2>/dev/null || echo 0)
+    STATE=$(vim-cmd vmsvc/power.getstate $VMID 2>/dev/null | tail -1)
+    SNAPS=$(vim-cmd vmsvc/snapshot.get $VMID 2>/dev/null | grep -c "Snapshot Name" 2>/dev/null || echo 0)
     printf "%s|%s|%s\n" "$VMID" "${STATE:-Unknown}" "${SNAPS:-0}"
 done'
 
@@ -761,32 +772,45 @@ transfer_vm() {
     fi
 
     mkdir -p "$dst"
-    log "rsync start: ${ESXI_HOST}:${src}/ → ${dst}/"
 
-    # Include only useful files; exclude VMware-specific cruft.
-    # --exclude="*" at the end blocks anything not explicitly included.
-    # This also naturally handles split-VMDK chunks (they end in .vmdk, so included)
-    # while the descriptor file (also .vmdk) anchors the conversion later.
-    esxi_rsync "${src}/" \
-        --include="*.vmdk" \
-        --include="*.vmx" \
-        --include="*.nvram" \
-        --exclude="*.vmsd" \
-        --exclude="*.vmxf" \
-        --exclude="*.log" \
-        --exclude="*.lck" \
-        --exclude="*.lck/**" \
-        --exclude="*" \
-        "$dst/"
+    # Get the file list from ESXi using find.
+    # We include only vmdk, vmx, nvram and exclude lock dirs, logs, vmsd, vmxf.
+    # find -type f ensures we skip .lck directories entirely.
+    local file_list
+    file_list=$(esxi_ssh "find '${src}' -maxdepth 1 -type f \( \
+        -name '*.vmdk' -o -name '*.vmx' -o -name '*.nvram' \
+        \) 2>/dev/null | sort") || {
+        err "Could not list files in ${src}"; return 1
+    }
 
-    local rc=$?
-    if [[ $rc -eq 0 ]]; then
-        info "Transfer complete: $vmname"
-        log "rsync OK: $vmname"
+    if [[ -z "$file_list" ]]; then
+        err "No transferable files found in ${src}"; return 1
+    fi
+
+    local total_files; total_files=$(echo "$file_list" | wc -l)
+    local file_num=0
+    local any_failed=false
+
+    while IFS= read -r remote_file; do
+        [[ -z "$remote_file" ]] && continue
+        local fname; fname=$(basename "$remote_file")
+        ((file_num++))
+        info "[$file_num/$total_files] $fname"
+        log "Transferring: ${ESXI_HOST}:${remote_file} → ${dst}/${fname}"
+
+        esxi_transfer_file "$remote_file" "${dst}/${fname}" || {
+            any_failed=true
+            read -rp "$(echo -e "${CYAN}Continue with remaining files?${NC} [Y/n]: ")" c
+            [[ "${c,,}" == "n" ]] && return 1
+        }
+    done <<< "$file_list"
+
+    if $any_failed; then
+        warn "Transfer completed with errors — some files may be missing."
+        log "Transfer PARTIAL: $vmname"
     else
-        err "rsync failed (exit code: $rc)"
-        log "rsync FAIL: $vmname rc=$rc"
-        return 1
+        info "Transfer complete: $vmname"
+        log "Transfer OK: $vmname"
     fi
 }
 
