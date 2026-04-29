@@ -16,7 +16,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.1.8"
 LOG_FILE="/var/log/esxi-migrate-$(date +%Y%m%d-%H%M%S).log"
 DEFAULT_STAGING="/var/lib/vz/images/tmp"
 SSH_CTL_PATH="/tmp/esxi-mig-ctl"          # SSH ControlMaster socket path
@@ -60,7 +60,7 @@ _ssh_base_opts() {
           -o ConnectTimeout=15 \
           -o ControlMaster=auto \
           -o ControlPath=${SSH_CTL_PATH} \
-          -o ControlPersist=300"
+          -o ControlPersist=28800"
 }
 
 esxi_ssh() {
@@ -119,6 +119,34 @@ esxi_transfer_file() {
     if [[ ${pipe_rc[0]} -ne 0 || ${pipe_rc[1]} -ne 0 ]]; then
         err "Transfer failed: $(basename "$remote_src")  (ssh:${pipe_rc[0]} dd:${pipe_rc[1]})"
         return 1
+    fi
+
+    # Guard against silent empty transfers — dd exits 0 even if SSH produced
+    # no data (e.g. stale ControlMaster socket, ESXi connection limit hit).
+    # A 0-byte transferred file would cause qemu-img to fail downstream.
+    local dst_size
+    dst_size=$(stat -c%s "$local_dst" 2>/dev/null || echo 0)
+    if [[ "${dst_size:-0}" -eq 0 ]]; then
+        rm -f "$local_dst"
+        err "Transfer produced empty file: $(basename "$remote_src") — retrying without ControlMaster..."
+
+        # Retry with a fresh direct connection (no ControlMaster) to rule out
+        # a stale/expired socket as the cause.
+        rm -f "${SSH_CTL_PATH}"
+        local retry_rc
+        if $ESXI_USE_KEY; then
+            ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15                 -i "$ESXI_KEY_PATH" "${ESXI_USER}@${ESXI_HOST}"                 "cat '${remote_src}'" 2>/dev/null                 | dd of="$local_dst" bs=1M conv=sparse status=progress 2>&1
+        else
+            sshpass -p "$ESXI_PASS"                 ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15                 "${ESXI_USER}@${ESXI_HOST}"                 "cat '${remote_src}'" 2>/dev/null                 | dd of="$local_dst" bs=1M conv=sparse status=progress 2>&1
+        fi
+        retry_rc=("${PIPESTATUS[@]}")
+        dst_size=$(stat -c%s "$local_dst" 2>/dev/null || echo 0)
+        if [[ ${retry_rc[0]} -ne 0 || ${retry_rc[1]} -ne 0 || "${dst_size:-0}" -eq 0 ]]; then
+            rm -f "$local_dst"
+            err "Retry also failed for: $(basename "$remote_src")"
+            return 1
+        fi
+        info "Retry succeeded for: $(basename "$remote_src")"
     fi
     return 0
 }
@@ -696,7 +724,7 @@ manage_queue() {
                 read -rp "$(echo -e "${CYAN}Clear entire queue?${NC} [y/N]: ")" confirm
                 if [[ "${confirm,,}" == "y" ]]; then
                     VM_QUEUE=()
-                    declare -A VM_BRIDGE=()
+                    VM_BRIDGE=()    # simple assignment clears global; declare here would create a local shadow
                     info "Queue cleared."
                 fi ;;
             q|"")
@@ -856,10 +884,35 @@ convert_vm() {
         descs+=("$f")
     done < <(find "$vmdir" -maxdepth 1 -name "*.vmdk" | sort)
 
+    # Fallback: if no descriptor found, check for flat VMDKs and treat them
+    # as raw disk images. This handles the case where the descriptor failed
+    # to transfer but the data file made it across (or where ESXi stores the
+    # disk as a single file without a separate -flat partner).
     if [[ ${#descs[@]} -eq 0 ]]; then
-        err "No VMDK descriptor files found in $vmdir"; return 1
+        warn "No VMDK descriptor files found — checking for flat VMDKs to use as raw images..."
+        local -a flat_vmdks=()
+        while IFS= read -r f; do
+            flat_vmdks+=("$f")
+        done < <(find "$vmdir" -maxdepth 1 -name "*-flat.vmdk" | sort)
+
+        if [[ ${#flat_vmdks[@]} -eq 0 ]]; then
+            err "No usable VMDK files found in $vmdir"
+            return 1
+        fi
+
+        warn "${#flat_vmdks[@]} flat VMDK(s) found — will convert as raw disk images."
+        warn "Disk geometry metadata from the descriptor will not be available."
+        warn "The conversion should still produce a bootable disk in most cases."
+        echo ""
+        read -rp "$(echo -e "${CYAN}Proceed with raw conversion?${NC} [Y/n]: ")" c
+        [[ "${c,,}" == "n" ]] && return 1
+
+        # Swap in the flat files and force raw input format
+        descs=("${flat_vmdks[@]}")
+        CONVERT_FORMAT_OVERRIDE_INPUT="raw"
     fi
-    info "${#descs[@]} disk descriptor(s) to convert."
+
+    info "${#descs[@]} disk(s) to convert."
 
     # Allow per-VM format override (session default shown as reference)
     echo ""
@@ -884,7 +937,9 @@ convert_vm() {
         info "Converting disk $((dnum+1))/${#descs[@]}: $(basename "$desc") → $(basename "$out")"
         log "qemu-img: $desc → $out fmt=$cfmt"
 
-        if qemu-img convert -p -f vmdk $copts -O "$cfmt" "$desc" "$out"; then
+        # Use raw input format if the fallback path set the override
+        local in_fmt="${CONVERT_FORMAT_OVERRIDE_INPUT:-vmdk}"
+        if qemu-img convert -p -f "$in_fmt" $copts -O "$cfmt" "$desc" "$out"; then
             info "Conversion complete."
 
             if qemu-img check "$out" &>/dev/null; then
@@ -905,6 +960,7 @@ convert_vm() {
             return 1
         fi
     done
+    unset CONVERT_FORMAT_OVERRIDE_INPUT
 }
 
 # ─── Create Proxmox VM ────────────────────────────────────────────────────────
