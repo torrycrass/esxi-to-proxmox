@@ -16,7 +16,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.2.2"
 LOG_FILE="/var/log/esxi-migrate-$(date +%Y%m%d-%H%M%S).log"
 DEFAULT_STAGING="/var/lib/vz/images/tmp"
 SSH_CTL_PATH="/tmp/esxi-mig-ctl"          # SSH ControlMaster socket path
@@ -896,61 +896,46 @@ transfer_vm() {
 
     mkdir -p "$dst"
 
-    # Build a prioritized file list — small metadata files transfer first,
-    # flat VMDKs (the large data files) transfer last. This ensures that if
-    # the connection has any issue during a long VMDK transfer, the VMX and
-    # descriptor are already on disk so conversion and VM creation can proceed.
-    #
-    # Priority order:
-    #   1) .vmx           — VM configuration (needed for CPU/RAM/NIC/firmware detection)
-    #   2) .nvram         — BIOS/UEFI state
-    #   3) descriptor .vmdk  — small metadata file that references the flat data
-    #   4) -flat.vmdk     — actual disk data (potentially hundreds of GB, always last)
+    # Build an ordered file list — two separate find calls on ESXi.
+    # Small files first (vmx, nvram, descriptor vmdks), large flat vmdks last.
+    # This is intentionally simple: no grep chain, no bucket logic.
+    # If anything goes wrong with a multi-hour flat VMDK transfer, the VMX
+    # and descriptor are already on disk so conversion/creation can still proceed.
 
-    local all_files
-    all_files=$(esxi_ssh "find '${src}' -maxdepth 1 -type f \( \
-        -name '*.vmdk' -o -name '*.vmx' -o -name '*.nvram' \
-        \) 2>/dev/null") || {
-        err "Could not list files in ${src}"; return 1
-    }
+    local small_files flat_files
+    # Small files: vmx, nvram, and descriptor VMDKs
+    # Descriptor VMDKs do NOT contain -flat, -delta, or -s### in their name
+    small_files=$(esxi_ssh "find '${src}' -maxdepth 1 -type f \( \
+        -name '*.vmx' -o -name '*.nvram' \
+        \) 2>/dev/null
+        find '${src}' -maxdepth 1 -type f -name '*.vmdk' 2>/dev/null \
+        | grep -v 'flat\.vmdk$' \
+        | grep -v 'delta\.vmdk$' \
+        | grep -v 's[0-9][0-9][0-9]\.vmdk$'") || true
 
-    if [[ -z "$all_files" ]]; then
+    # Large files: flat VMDKs, delta VMDKs, split-chunk VMDKs
+    flat_files=$(esxi_ssh "find '${src}' -maxdepth 1 -type f -name '*.vmdk' 2>/dev/null \
+        | grep -E '(flat\.vmdk|delta\.vmdk|s[0-9][0-9][0-9]\.vmdk)$'") || true
+
+    # Combine: small first, large last, remove blank lines
+    local file_list
+    file_list=$(printf '%s
+%s
+' "$small_files" "$flat_files" | grep -v '^[[:space:]]*$' || true)
+
+    if [[ -z "$file_list" ]]; then
         err "No transferable files found in ${src}"; return 1
     fi
 
-    # Split into priority buckets then combine
-    local vmx_files nvram_files desc_files flat_files
-    vmx_files=$(echo  "$all_files" | grep '\.vmx$'        || true)
-    nvram_files=$(echo "$all_files" | grep '\.nvram$'      || true)
-    # Descriptor VMDKs: end in .vmdk but NOT -flat.vmdk, NOT -delta.vmdk,
-    # NOT split chunks (-s001.vmdk etc)
-    desc_files=$(echo  "$all_files" | grep '\.vmdk$'         | grep -v '\-flat\.vmdk$'         | grep -v '\-delta\.vmdk$'         | grep -vE '\-s[0-9]{3}\.vmdk$' || true)
-    # Flat/split/delta VMDKs — the large ones, always last
-    flat_files=$(echo  "$all_files" | grep '\.vmdk$'         | grep -vE "$desc_files" 2>/dev/null         | grep -E '(\-flat\.vmdk$|\-delta\.vmdk$|\-s[0-9]{3}\.vmdk$)' || true)
-    # Any remaining VMDKs not caught above
-    other_vmdks=$(echo "$all_files" | grep '\.vmdk$'         | grep -v '\-flat\.vmdk$'         | grep -v '\-delta\.vmdk$'         | grep -vE '\-s[0-9]{3}\.vmdk$'         | grep -v "$(echo "$desc_files" | tr '
-' '|' | sed 's/|$//')" 2>/dev/null || true)
-
-    # Build ordered list: vmx → nvram → descriptors → flat/large VMDKs
-    local file_list=""
-    for bucket in "$vmx_files" "$nvram_files" "$desc_files" "$flat_files"; do
-        [[ -n "$bucket" ]] && file_list+="${bucket}"$'
-'
-    done
-    file_list=$(echo "$file_list" | grep -v '^$' || true)
-
-    if [[ -z "$file_list" ]]; then
-        err "File list empty after sorting — check ESXi path and permissions"; return 1
-    fi
-
-    local total_files; total_files=$(echo "$file_list" | grep -c '.' || echo 0)
+    local total_files
+    total_files=$(echo "$file_list" | wc -l)
     info "Transfer order ($total_files files — metadata first, disk data last):"
     local preview_num=1
     while IFS= read -r f; do
         [[ -z "$f" ]] && continue
         local sz
         sz=$(esxi_ssh "du -sh '${f}' 2>/dev/null | cut -f1" || echo "?")
-        printf "    %2d) %-50s %s
+        printf "    %2d) %-52s %s
 " "$preview_num" "$(basename "$f")" "$sz"
         ((preview_num++))
     done <<< "$file_list"
@@ -968,7 +953,6 @@ transfer_vm() {
 
         esxi_transfer_file "$remote_file" "${dst}/${fname}" || {
             any_failed=true
-            # For metadata files (vmx/nvram/descriptor) a failure is critical
             if [[ "$fname" == *.vmx || "$fname" == *.nvram ]]; then
                 warn "Metadata file failed — VM creation will be impaired without it."
             fi
@@ -985,7 +969,6 @@ transfer_vm() {
         log "Transfer OK: $vmname"
     fi
 }
-
 # ─── Convert Disks ────────────────────────────────────────────────────────────
 convert_vm() {
     local vmname="$1"
