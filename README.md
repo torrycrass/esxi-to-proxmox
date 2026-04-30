@@ -1,27 +1,22 @@
 # esxi-to-proxmox
 
-A menu-driven shell script for migrating virtual machines from a VMware ESXi host to Proxmox VE. Runs on the Proxmox host and pulls VMs across the wire via SSH and rsync — no vCenter, no VDDK, no VMware CLI gymnastics required.
+A menu-driven shell script for migrating virtual machines from a VMware ESXi host to Proxmox VE. Runs on the Proxmox host and pulls VMs across the wire via SSH — no vCenter, no VDDK, no VMware CLI required.
 
 ---
 
 ## Background
 
-Migrating VMs off ESXi — especially the free hypervisor tier — is more painful than it should be. The free tier locks out the API and VDDK layer, vSphere Converter is end-of-life, and the ESXi shell tooling is minimal. This script fills that gap by working entirely through SSH, using tools already present on a standard Proxmox VE host.
+Migrating VMs off ESXi — especially the free hypervisor tier — is more painful than it should be. The free tier locks out the API and VDDK layer, vSphere Converter is end-of-life, and the ESXi shell tooling is minimal. This script fills that gap by working entirely through SSH using tools already present on a standard Proxmox VE host.
 
-It was built specifically for the scenario of migrating an on-premise ESXi fleet to Proxmox without cloud involvement, and handles the real-world messiness of that process: thin-provisioned disks, split VMDKs, multi-disk VMs, per-VM network assignments, BIOS/UEFI detection, and large inventories.
+It was built for the scenario of migrating an on-premise ESXi fleet to Proxmox without cloud involvement, and handles the real-world messiness of that process: thin-provisioned disks, split VMDKs, multi-disk VMs, multi-NIC VMs, per-VM network assignments, BIOS/UEFI detection, OS-aware defaults, and large inventories.
 
 ---
 
 ## Requirements
 
 ### Proxmox Host (where the script runs)
-- Proxmox VE (Debian-based) — must run as **root**
-- `ssh`
-- `rsync`
-- `qemu-img`
-- `qm` (included with Proxmox VE)
-- `pvesm` (included with Proxmox VE)
-- `python3` (included with Proxmox VE)
+- Proxmox VE (Debian-based) — **must run as root**
+- `ssh`, `rsync`, `qemu-img`, `qm`, `pvesm`, `python3`
 
 ### Optional (Proxmox host)
 - `sshpass` — required only for password-based auth (`apt-get install sshpass`)
@@ -30,8 +25,22 @@ It was built specifically for the scenario of migrating an on-premise ESXi fleet
 ### ESXi Host
 - ESXi 6.x or 7.x (free tier supported)
 - SSH access enabled: **Host → Actions → Services → Enable Secure Shell**
-- `vim-cmd` available (standard on all ESXi installs)
 - No vCenter or additional licensing required
+
+---
+
+## Staging Space — Important
+
+The script transfers disk files to a local staging directory before converting them. **This directory must have enough free space to hold the transferred disk data.**
+
+> **Do not use your OS drive as staging.** If the root partition fills up during a transfer, Proxmox itself can become unstable or unresponsive. Use a separate data partition or mount point. The default staging path is `/var/lib/vz/images/tmp` — verify this is on a data volume, not your root filesystem, before migrating large VMs.
+
+Check available space before starting:
+```bash
+df -h /mnt/your-staging-path
+```
+
+As a safe rule: ensure staging has at least **1.5× the actual used disk size** of the largest VM you are migrating.
 
 ---
 
@@ -41,198 +50,226 @@ It was built specifically for the scenario of migrating an on-premise ESXi fleet
 # On your Proxmox host, as root:
 wget https://raw.githubusercontent.com/yourusername/esxi-to-proxmox/main/esxi-migrate.sh
 chmod +x esxi-migrate.sh
-```
-
-Or clone the repo:
-
-```bash
-git clone https://github.com/yourusername/esxi-to-proxmox.git
-cd esxi-to-proxmox
-chmod +x esxi-migrate.sh
-```
-
-> **Note:** The script must be run as root on the Proxmox host. Several operations (`qm`, `pvesm`, writing to Proxmox storage paths) require root. SSH into Proxmox as root, or use `sudo -i` to open a root shell first.
-
----
-
-## Usage
-
-```bash
 bash esxi-migrate.sh [esxi-host-ip]
 ```
 
-The ESXi host IP is optional — you can also enter it from the menu.
+> **Must run as root.** `qm`, `pvesm`, and Proxmox storage paths all require root. SSH in as root or use `sudo -i` first.
 
-### Menu Overview
+---
+
+## Menu Overview
 
 ```
-╔══════════════════════════════════════════════════╗
-║      ESXi → Proxmox Migration Tool               ║
-╚══════════════════════════════════════════════════╝
-
   1)  Check prerequisites
   2)  Configure ESXi connection
   3)  Select datastore
   4)  Scan VMs on ESXi
   5)  Display VM list
   6)  Select VMs for migration  (assigns per-VM bridges)
-  7)  Configure Proxmox settings  (storage / default bridge / format)
+  7)  Configure Proxmox settings  (storage / bridge / format / machine / CPU / disk bus)
   8)  Manage queue  (remove VMs, reassign bridges, clear)
-  9)  ▶  Start migration
+  9)  Start migration
  10)  View log
-  0)  Exit
 ```
 
 ### Recommended First-Run Order
-
-1. **Option 1** — verify all required tools are present
-2. **Option 2** — enter ESXi host IP and authenticate (SSH key recommended)
-3. **Option 3** — select the datastore your VMs live on
-4. **Option 4** — scan the ESXi host (single SSH session, handles large inventories)
-5. **Option 5** — review the VM list with power state, snapshot status, and transfer safety
-6. **Option 6** — queue VMs for migration; assign a bridge to each VM at this step
-7. **Option 7** — set Proxmox storage target, default bridge, and disk format
-8. **Option 8** — optionally adjust the queue (remove VMs, reassign bridges)
-9. **Option 9** — start the migration
+Run options 1 → 2 → 3 → 4 → 7 → 6 → 9. Configure Proxmox settings (option 7) before selecting VMs (option 6) so the session defaults are in place when you queue VMs.
 
 ---
 
 ## What It Does (Per VM)
 
 ### Transfer
-Uses `rsync --sparse` to pull only the data actually written to disk. A 500 GB thin-provisioned VM with 60 GB of actual data transfers ~60 GB, not 500 GB.
+Files are transferred in priority order — **metadata first, disk data last**:
 
-**Files included:**
-| File | Purpose |
-|------|---------|
-| `*.vmdk` | VM disk (descriptor + data, including split-chunk VMDKs) |
-| `*.vmx` | VM configuration — parsed for CPU, RAM, firmware, OS, NIC type |
-| `*.nvram` | BIOS/UEFI state |
+1. `.vmx` — VM configuration (CPU, RAM, firmware, OS, NICs)
+2. `.nvram` — BIOS/UEFI state
+3. VMDK descriptor — small metadata file
+4. Flat VMDKs — the large disk data files, always last
 
-**Files excluded:**
-| File | Reason |
-|------|--------|
-| `*.vmsd` | Snapshot database — meaningless outside VMware |
-| `*.vmxf` | Extended VMware config — not applicable |
-| `*.log` | VMware runtime logs |
-| `*.lck` | VMware file lock directories |
+This ensures that if a connection issue interrupts a long disk transfer, the VMX is already on disk and VM creation can still proceed correctly.
+
+File transfers use `ssh cat | dd conv=sparse` — ESXi does not include rsync, so this is the reliable alternative. Zero-filled blocks are written as filesystem holes on the destination, preserving thin provisioning. Each file is verified non-empty after transfer and retried with a fresh connection if empty.
+
+**Files excluded:** `*.vmsd`, `*.vmxf`, `*.log`, `*.lck`
 
 ### Conversion
-Runs `qemu-img convert` on the transferred VMDK descriptor file. Supported output formats (selectable per-VM or as a session default):
+`qemu-img convert` runs on the VMDK descriptor. If only a flat VMDK transferred (descriptor missing), the script falls back to treating it as raw. `qemu-img check` runs after conversion to verify integrity.
 
-| Format | Notes |
-|--------|-------|
-| `qcow2` thin *(default)* | Proxmox native, supports snapshots |
-| `qcow2` compressed | Smaller file, slightly higher CPU overhead on I/O |
-| `raw` thin | Best I/O performance, no snapshot support |
-| `raw` thick | Full pre-allocation, maximum compatibility |
+**Storage format guidance:**
 
-Runs `qemu-img check` after conversion to verify image integrity before import.
+| Storage type | Supported formats | Snapshot support |
+|---|---|---|
+| LVM-thin | raw only | Yes — native LVM CoW |
+| ZFS | raw only | Yes — native ZFS snapshots |
+| Directory | raw, qcow2, vmdk | Yes — via qcow2 |
+
+The script detects the storage type and automatically switches to raw if qcow2 is not supported, rather than failing at import time.
 
 ### VM Creation
-Reads the `.vmx` file and maps settings to Proxmox equivalents:
+The `.vmx` file is parsed and mapped to Proxmox settings automatically:
 
-| VMX Setting | Proxmox Setting |
-|-------------|----------------|
+| VMX | Proxmox |
+|-----|---------|
 | `numvcpus` | `--cores` |
 | `memsize` | `--memory` |
-| `firmware = "efi"` | `--bios ovmf` |
-| `guestOS` | `--ostype` (mapped to Proxmox type) |
-| `ethernet0.virtualDev = "vmxnet3"` | `--net0 virtio,...` |
-| `ethernet0.virtualDev = "e1000"` | `--net0 e1000,...` |
+| `firmware = "efi"` | `--bios ovmf` + EFI disk |
+| `firmware = "bios"` / absent | SeaBIOS |
+| `guestOS` | `--ostype` (auto-mapped) |
+| `ethernetN.virtualDev` | Per-NIC model, prompted individually |
 
-All detected values are shown and can be overridden before the VM is created. VMID is auto-assigned via Proxmox but can be changed at the prompt.
-
----
-
-## VM Safety Indicators
-
-The VM list display flags each VM for safe transfer:
-
-| Indicator | Meaning |
-|-----------|---------|
-| `YES` (green) | Powered off, no snapshots — safe to transfer |
-| `CONSOLIDATE` (yellow) | Has snapshots — see note below |
-| `NO (running)` (red) | VM is powered on — risk of inconsistent disk state |
-
-### Snapshots
-
-VMware snapshot chains cannot be reconstructed by `qemu-img`. Before migrating any VM with snapshots, consolidate them in ESXi first:
-
-**ESXi web UI:** Right-click VM → Snapshots → Delete All
-
-The script will warn you and ask for confirmation if you attempt to queue a VM with active snapshots.
+All values are shown before creation and can be overridden at the prompt.
 
 ---
 
-## Per-VM Bridge Assignment
+## VM Settings Guide
 
-Each VM can be assigned to a different Proxmox bridge at queue time (option 6). The session default bridge is used as the starting value but can be overridden per VM. Assignments can be reviewed and changed anytime via option 8 (queue manager) or at the final confirmation step before each VM is created.
+### Machine Type
+Both Linux and Windows VMs run on one of two virtual chipsets:
+
+| Option | Chipset | Recommendation |
+|--------|---------|----------------|
+| Default | Proxmox decides and pins | Safe for all VMs |
+| `pc` | i440FX / PIIX | Windows VMs migrating from VMware (closest to VMware's virtual hardware) |
+| `q35` | PCIe / ICH9 | Linux VMs; Windows 10/11 after initial boot confirmed |
+
+Linux VMs boot fine on either. Windows is more sensitive — `pc` is the safer initial choice.
+
+### CPU Type
+
+| Option | Notes |
+|--------|-------|
+| `kvm64` | Safe default — works across CPU generations, supports live migration |
+| `host` | Best performance — passes host CPU features through, ties VM to matching hardware |
+| `x86-64-v2-AES` | Good balance — modern baseline with AES acceleration |
+
+### Disk Bus
+
+| Option | Notes |
+|--------|-------|
+| `scsi` (virtio-scsi-pci) | Best for Linux — kernel has native drivers |
+| `sata` | **Best for Windows initially** — boots without extra drivers |
+| `ide` | Most compatible fallback |
+| `virtio` | Fastest Linux I/O |
+
+> **Windows tip:** Start with `sata`. After booting and installing VirtIO drivers, change to `scsi` for better performance.
+
+### Network Adapter
+Set per-NIC at VM creation time. VMware adapter types are automatically mapped:
+
+| VMware | Proxmox |
+|--------|---------|
+| vmxnet3 | virtio |
+| e1000 / e1000e | e1000 |
+
+> **Windows tip:** `e1000` works without extra drivers. Switch to `virtio` after VirtIO drivers are installed.
+
+---
+
+## Multi-NIC VMs
+
+All adapters defined in the VMX are detected automatically. At VM creation you are prompted for bridge and model per NIC:
+
+```
+  NIC 1 of 3  (VMware: vmxnet3  →  Proxmox default: virtio)
+    Bridge [vmbr0]:
+    Model  [virtio]:
+
+  NIC 2 of 3  (VMware: e1000  →  Proxmox default: e1000)
+    Bridge [vmbr0]:  vmbr1
+    Model  [e1000]:
+```
+
+NIC 0 defaults to the bridge assigned at queue time. Additional NICs default to the session bridge.
+
+---
+
+## Troubleshooting Boot Problems
+
+If a migrated VM fails to boot, start with these two settings in the Proxmox web UI:
+
+**1. BIOS type mismatch**
+The script auto-detects `firmware = "efi"` in the VMX and sets OVMF, with SeaBIOS as the default for anything else. If a VM was running SeaBIOS in VMware but the VMX firmware line wasn't parsed correctly, it may have been created with the wrong BIOS type. Check:
+```bash
+grep -i firmware /path/to/vm.vmx
+```
+If the line is absent or says `bios`, the VM uses SeaBIOS. Correct the BIOS type in Proxmox under VM → Hardware → BIOS. No data is lost changing this setting.
+
+**2. OS type**
+The `ostype` setting affects what virtual hardware features Proxmox presents. Linux VMs should be `l26` (Linux 2.6+ kernel). If the VMX `guestOS` string wasn't recognized it may have defaulted to `other`. Change it under VM → Options → OS Type — no reinstallation required.
+
+Common values: `l26` (Linux), `win10` (Windows 10/11/2019/2022), `win8` (Windows 8/2012), `other`.
 
 ---
 
 ## Windows VMs
 
-The script detects Windows guest OS from the `.vmx` file and warns before creation. Windows VMs migrated via `qemu-img` will likely **not boot** without VirtIO drivers. The recommended path for Windows is `virt-v2v`, which injects drivers automatically:
+Windows VMs need extra handling due to VirtIO driver requirements. Options:
 
+**Option A — SATA/e1000 first (simpler):**
+Set disk bus to `sata` and NIC to `e1000` in option 7 before migrating. Windows boots with built-in drivers. Then install VirtIO drivers from the [VirtIO ISO](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso) and switch to scsi/virtio for performance.
+
+**Option B — virt-v2v (automated driver injection):**
 ```bash
 apt-get install virt-v2v
-
 virt-v2v -i vmx '/path/to/vm.vmx' \
   -o local -os /var/lib/vz/images/tmp \
   --bridge vmbr0
 ```
-
-The script displays the exact `virt-v2v` command for each detected Windows VM.
+The script prints the exact command for each detected Windows VM.
 
 ---
 
-## Multi-Disk VMs
+## Snapshots
 
-VMs with multiple VMDKs are handled automatically. The script finds all VMDK descriptor files in the VM directory, converts each one, and attaches them as sequential SCSI devices (`scsi0`, `scsi1`, etc.) on the Proxmox VM.
+VMware snapshot chains cannot be reconstructed by `qemu-img`. Consolidate before migrating:
 
-## Split VMDKs (2 GB chunks)
+**ESXi web UI:** Right-click VM → Snapshots → Delete All
 
-VMDKs split into 2 GB chunks (common on older VMware deployments) are handled transparently. `qemu-img` reads the descriptor file and reassembles the chunks automatically. All split files are included in the rsync transfer.
+The script warns and asks for confirmation if you attempt to queue a VM with active snapshots.
 
 ---
 
 ## SSH Authentication
 
-SSH key authentication is strongly recommended over password auth. To set up key access to an ESXi host (ESXi doesn't support `ssh-copy-id` directly):
-
+SSH key auth is strongly recommended. To install a key on ESXi:
 ```bash
-# Generate a key if you don't have one
 ssh-keygen -t ed25519 -f ~/.ssh/id_esxi
-
-# Install it on ESXi
 cat ~/.ssh/id_esxi.pub | ssh root@your-esxi-host \
   'cat >> /etc/ssh/keys-root/authorized_keys'
 ```
 
-Password auth is supported via `sshpass` if needed.
+Password auth is supported via `sshpass` (`apt-get install sshpass`).
 
 ---
 
 ## Logging
 
-Every migration run writes a timestamped log to `/var/log/esxi-migrate-YYYYMMDD-HHMMSS.log`. The log captures all SSH operations, rsync transfers, conversion commands, `qm` invocations, and success/failure status per VM. Viewable from within the script via option 10.
+Every run writes a timestamped log to `/var/log/esxi-migrate-YYYYMMDD-HHMMSS.log`. View it from within the script via option 10.
 
 ---
 
 ## Known Limitations
 
-- **Snapshot consolidation must happen on ESXi** — the script cannot consolidate snapshots remotely; this is a VMware-side operation
-- **Live VM migration is not safe** — the script warns but cannot prevent transferring a running VM; the resulting disk image may be inconsistent
-- **Windows VMs require `virt-v2v`** — direct `qemu-img` conversion produces a non-bootable result without driver injection
-- **ESXi free tier only** — the script uses SSH and `vim-cmd`, not the vSphere API; vCenter environments could use this approach but there may be better options available to licensed users
-- **Must run as root on Proxmox** — `qm`, `pvesm`, and Proxmox storage paths all require root access
+- **Snapshot consolidation must happen on ESXi** — cannot be done remotely
+- **Live VM transfer is not safe** — inconsistent disk state; script warns but cannot prevent
+- **Windows VMs require extra steps** — VirtIO drivers or sata/e1000 workaround
+- **No rsync on ESXi** — full thin-provisioned size transfers over the wire
+- **Must run as root on Proxmox**
+
+---
+
+## TODO
+
+- [ ] Clean up bridge assignment — currently set at queue time, per-NIC at creation, and as session default; some redundancy exists
+- [ ] OS-aware VM setting defaults — auto-suggest `q35/scsi/virtio` for Linux and `pc/sata/e1000` for Windows based on detected guestOS
+- [ ] Resume interrupted transfers — currently re-runs full transfer if any file failed
 
 ---
 
 ## Contributing
 
-Issues and pull requests welcome. If you run into ESXi version-specific output format differences (particularly in `vim-cmd` output), opening an issue with the raw output is the most helpful thing you can do — ESXi's BusyBox environment varies enough between versions that edge cases are expected.
+Issues and PRs welcome. If you hit ESXi version-specific differences in `vim-cmd` output or BusyBox tool availability, open an issue with the raw output — ESXi's environment varies enough between builds that edge cases are expected.
 
 ---
 
