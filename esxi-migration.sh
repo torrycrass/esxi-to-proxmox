@@ -16,7 +16,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.2.3"
+SCRIPT_VERSION="1.2.4"
 LOG_FILE="/var/log/esxi-migrate-$(date +%Y%m%d-%H%M%S).log"
 DEFAULT_STAGING="/var/lib/vz/images/tmp"
 SSH_CTL_PATH="/tmp/esxi-mig-ctl"          # SSH ControlMaster socket path
@@ -116,9 +116,9 @@ esxi_transfer_file() {
     local opts; opts=$(_ssh_base_opts)
 
     if $ESXI_USE_KEY; then
-        ssh $opts -i "$ESXI_KEY_PATH" "${ESXI_USER}@${ESXI_HOST}"             "cat '${remote_src}'" 2>/dev/null             | dd of="$local_dst" bs=1M conv=sparse status=progress 2>&1
+        ssh -n $opts -i "$ESXI_KEY_PATH" "${ESXI_USER}@${ESXI_HOST}"             "cat '${remote_src}'" 2>/dev/null             | dd of="$local_dst" bs=1M conv=sparse status=progress 2>&1
     else
-        sshpass -p "$ESXI_PASS" ssh $opts "${ESXI_USER}@${ESXI_HOST}"             "cat '${remote_src}'" 2>/dev/null             | dd of="$local_dst" bs=1M conv=sparse status=progress 2>&1
+        sshpass -p "$ESXI_PASS" ssh -n $opts "${ESXI_USER}@${ESXI_HOST}"             "cat '${remote_src}'" 2>/dev/null             | dd of="$local_dst" bs=1M conv=sparse status=progress 2>&1
     fi
 
     local pipe_rc=("${PIPESTATUS[@]}")
@@ -142,9 +142,9 @@ esxi_transfer_file() {
         rm -f "${SSH_CTL_PATH}"
         local retry_rc
         if $ESXI_USE_KEY; then
-            ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15                 -i "$ESXI_KEY_PATH" "${ESXI_USER}@${ESXI_HOST}"                 "cat '${remote_src}'" 2>/dev/null                 | dd of="$local_dst" bs=1M conv=sparse status=progress 2>&1
+            ssh -n -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15                 -i "$ESXI_KEY_PATH" "${ESXI_USER}@${ESXI_HOST}"                 "cat '${remote_src}'" 2>/dev/null                 | dd of="$local_dst" bs=1M conv=sparse status=progress 2>&1
         else
-            sshpass -p "$ESXI_PASS"                 ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15                 "${ESXI_USER}@${ESXI_HOST}"                 "cat '${remote_src}'" 2>/dev/null                 | dd of="$local_dst" bs=1M conv=sparse status=progress 2>&1
+            sshpass -p "$ESXI_PASS"                 ssh -n -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15                 "${ESXI_USER}@${ESXI_HOST}"                 "cat '${remote_src}'" 2>/dev/null                 | dd of="$local_dst" bs=1M conv=sparse status=progress 2>&1
         fi
         retry_rc=("${PIPESTATUS[@]}")
         dst_size=$(stat -c%s "$local_dst" 2>/dev/null || echo 0)
