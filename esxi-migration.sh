@@ -16,7 +16,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.2.2"
+SCRIPT_VERSION="1.2.3"
 LOG_FILE="/var/log/esxi-migrate-$(date +%Y%m%d-%H%M%S).log"
 DEFAULT_STAGING="/var/lib/vz/images/tmp"
 SSH_CTL_PATH="/tmp/esxi-mig-ctl"          # SSH ControlMaster socket path
@@ -68,11 +68,14 @@ _ssh_base_opts() {
 }
 
 esxi_ssh() {
+    # -n redirects SSH stdin from /dev/null.
+    # Without this, SSH reads from the calling process's stdin, which silently
+    # consumes lines when called inside a "while read ... done <<< $var" loop.
     local opts; opts=$(_ssh_base_opts)
     if $ESXI_USE_KEY; then
-        ssh $opts -i "$ESXI_KEY_PATH" "${ESXI_USER}@${ESXI_HOST}" "$@" 2>/dev/null
+        ssh -n $opts -i "$ESXI_KEY_PATH" "${ESXI_USER}@${ESXI_HOST}" "$@" 2>/dev/null
     else
-        sshpass -p "$ESXI_PASS" ssh $opts "${ESXI_USER}@${ESXI_HOST}" "$@" 2>/dev/null
+        sshpass -p "$ESXI_PASS" ssh -n $opts "${ESXI_USER}@${ESXI_HOST}" "$@" 2>/dev/null
     fi
 }
 
