@@ -16,7 +16,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.2.4"
+SCRIPT_VERSION="1.2.5"
 LOG_FILE="/var/log/esxi-migrate-$(date +%Y%m%d-%H%M%S).log"
 DEFAULT_STAGING="/var/lib/vz/images/tmp"
 SSH_CTL_PATH="/tmp/esxi-mig-ctl"          # SSH ControlMaster socket path
@@ -60,7 +60,8 @@ pause()   { echo ""; read -rp "Press Enter to continue..."; }
 # ControlMaster=auto keeps one persistent connection; subsequent calls reuse it.
 # This avoids ESXi's low per-user SSH connection limits during bulk operations.
 _ssh_base_opts() {
-    echo "-o StrictHostKeyChecking=accept-new \
+    echo "-C \
+          -o StrictHostKeyChecking=accept-new \
           -o ConnectTimeout=15 \
           -o ControlMaster=auto \
           -o ControlPath=${SSH_CTL_PATH} \
@@ -142,9 +143,9 @@ esxi_transfer_file() {
         rm -f "${SSH_CTL_PATH}"
         local retry_rc
         if $ESXI_USE_KEY; then
-            ssh -n -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15                 -i "$ESXI_KEY_PATH" "${ESXI_USER}@${ESXI_HOST}"                 "cat '${remote_src}'" 2>/dev/null                 | dd of="$local_dst" bs=1M conv=sparse status=progress 2>&1
+            ssh -n -C -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15                 -i "$ESXI_KEY_PATH" "${ESXI_USER}@${ESXI_HOST}"                 "cat '${remote_src}'" 2>/dev/null                 | dd of="$local_dst" bs=1M conv=sparse status=progress 2>&1
         else
-            sshpass -p "$ESXI_PASS"                 ssh -n -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15                 "${ESXI_USER}@${ESXI_HOST}"                 "cat '${remote_src}'" 2>/dev/null                 | dd of="$local_dst" bs=1M conv=sparse status=progress 2>&1
+            sshpass -p "$ESXI_PASS"                 ssh -n -C -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15                 "${ESXI_USER}@${ESXI_HOST}"                 "cat '${remote_src}'" 2>/dev/null                 | dd of="$local_dst" bs=1M conv=sparse status=progress 2>&1
         fi
         retry_rc=("${PIPESTATUS[@]}")
         dst_size=$(stat -c%s "$local_dst" 2>/dev/null || echo 0)
